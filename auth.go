@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,11 +23,11 @@ type Auth struct {
 	password string
 	mu       sync.RWMutex
 	sessions map[string]time.Time
-	// 按来源 IP 记录登录失败，挡低速凭据喷洒
+	// 按来源IP 记录登录失败，挡低速凭据喷洒
 	fails map[string]*loginFails
 }
 
-// loginFails 跟踪单个来源 IP 的连续失败。
+// loginFails 跟踪单个来源IP 的连续失败。
 type loginFails struct {
 	count   int
 	last    time.Time
@@ -35,19 +36,18 @@ type loginFails struct {
 
 const sessionTTL = 12 * time.Hour
 
-// 登录失败节流：同一 IP 连续错 loginMaxFails 次后，锁 loginBlockFor。
-// 阈值给得宽松，正常用户偶尔输错不受影响；成功登录会清零。
+// 登录失败节流：同一IP 连续错loginMaxFails 次后，锁loginBlockFor。
 const (
 	loginMaxFails  = 8
 	loginBlockFor  = 2 * time.Minute
 	loginFailReset = 10 * time.Minute
+	maxTrackedIPs  = 4096
 )
 
 // NewAuth 载入或生成访问口令。返回口令是否为本次新建。
 func NewAuth(dir string) (*Auth, bool, error) {
 	path := filepath.Join(dir, "password")
 	created := false
-
 	blob, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		pw, gerr := randomToken(9)
@@ -62,7 +62,6 @@ func NewAuth(dir string) (*Auth, bool, error) {
 	} else if err != nil {
 		return nil, false, err
 	}
-
 	return &Auth{
 		dir:      dir,
 		password: strings.TrimSpace(string(blob)),
@@ -90,14 +89,13 @@ func (a *Auth) check(pw string) bool {
 }
 
 // SetPassword 改访问口令并落盘。空口令拒绝，避免误改成无密码裸奔。
-// 改完不动已有会话：当前登录的浏览器不会被踢，新登录才用新口令。
 func (a *Auth) SetPassword(pw string) error {
 	pw = strings.TrimSpace(pw)
 	if pw == "" {
 		return fmt.Errorf("口令不能为空")
 	}
 	if len(pw) < 4 {
-		return fmt.Errorf("口令至少 4 位")
+		return fmt.Errorf("口令至少4 位")
 	}
 	path := filepath.Join(a.dir, "password")
 	tmp := path + ".tmp"
@@ -113,20 +111,20 @@ func (a *Auth) SetPassword(pw string) error {
 	return nil
 }
 
-// issue 发一个会话 token。
+// issue 发一个会话token。
 func (a *Auth) issue() (string, error) {
 	tok, err := randomToken(16)
 	if err != nil {
 		return "", err
 	}
 	a.mu.Lock()
-	a.sessions[tok] = time.Now().Add(sessionTTL)
-	// 顺手清掉过期会话
+	now := time.Now()
 	for k, exp := range a.sessions {
-		if time.Now().After(exp) {
+		if now.After(exp) {
 			delete(a.sessions, k)
 		}
 	}
+	a.sessions[tok] = now.Add(sessionTTL)
 	a.mu.Unlock()
 	return tok, nil
 }
@@ -140,20 +138,46 @@ func (a *Auth) valid(tok string) bool {
 
 const sessionCookie = "fanout_session"
 
-// Wrap 保护一个 handler，未登录时 API 返回 401、页面跳登录。
+// checkCSRF 校验状态修改请求的Origin / Referer 是否同源，拦截跨站请求伪造。
+func checkCSRF(r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+	// 非浏览器工具或未携带头时结合SameSite Cookie 防护放行；若携带了Origin/Referer 则必须同Host
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// Wrap 保护一个handler，未登录时API 返回401、页面跳登录。
 func (a *Auth) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 基础安全响应头
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+
 		if r.URL.Path == "/login" {
 			a.handleLogin(w, r)
 			return
 		}
-		// 订阅得让客户端直接拉，带不了登录态，所以这条路放行。
-		// 它不是无门槛：handleSub 自己校验一串独立口令，且仍在访问路径之后。
 		if r.URL.Path == "/sub" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		if c, err := r.Cookie(sessionCookie); err == nil && a.valid(c.Value) {
+			if !checkCSRF(r) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "CSRF 校验未通过"})
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -166,7 +190,7 @@ func (a *Auth) Wrap(next http.Handler) http.Handler {
 	})
 }
 
-// blocked 判断某来源 IP 是否处于登录冷却期。
+// blocked 判断某来源IP 是否处于登录冷却期。
 func (a *Auth) blocked(ip string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -179,8 +203,21 @@ func (a *Auth) recordFail(ip string) {
 	now := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// 顺手清掉早已过期的记录，防止恶意IP 洪水撑爆内存
+	for k, v := range a.fails {
+		if now.Sub(v.last) > loginFailReset && now.After(v.blocked) {
+			delete(a.fails, k)
+		}
+	}
+	if len(a.fails) >= maxTrackedIPs {
+		for k := range a.fails {
+			delete(a.fails, k)
+			break
+		}
+	}
+
 	f, ok := a.fails[ip]
-	// 距上次失败太久就重新计数，避免长期累积误伤
 	if !ok || (f.blocked.IsZero() && now.Sub(f.last) > loginFailReset) {
 		f = &loginFails{}
 		a.fails[ip] = f
@@ -191,29 +228,44 @@ func (a *Auth) recordFail(ip string) {
 		f.blocked = now.Add(loginBlockFor)
 		f.count = 0
 	}
-	// 顺手清掉早已过期的记录，别让 map 无限增长
-	for k, v := range a.fails {
-		if now.Sub(v.last) > loginFailReset && now.After(v.blocked) {
-			delete(a.fails, k)
-		}
-	}
 }
 
-// clearFails 登录成功后清掉该 IP 的失败记录。
+// clearFails 登录成功后清掉该IP 的失败记录。
 func (a *Auth) clearFails(ip string) {
 	a.mu.Lock()
 	delete(a.fails, ip)
 	a.mu.Unlock()
 }
 
-// clientIP 从 RemoteAddr 取来源 IP。服务直接监听公网端口、不在反代后，
-// 所以不采信 X-Forwarded-For 之类可伪造的头。
+// clientIP 获取真实客户端IP：
+// 当请求来自公网直连时忽略伪造头；当请求来自本机回环反代（127.0.0.1 / ::1）时，
+// 采信反代传入的X-Real-IP 或X-Forwarded-For，避免攻击者输错8 次密码将127.0.0.1 锁死导致管理员DoS。
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(xrip) != nil {
+			return xrip
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first := strings.TrimSpace(strings.Split(xff, ",")[0])
+			if net.ParseIP(first) != nil {
+				return first
+			}
+		}
 	}
 	return host
+}
+
+// isSecureRequest 判断当前请求是否处于HTTPS 环境（原生TLS 或HTTPS 反代后）。
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +295,7 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
